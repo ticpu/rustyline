@@ -350,6 +350,14 @@ pub enum InputMode {
     Replace,
 }
 
+#[cfg(feature = "custom-bindings")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroState {
+    Idle,
+    Starting,
+    Active,
+}
+
 /// Transform key(s) to commands based on current input mode
 pub struct InputState<'b> {
     pub(crate) mode: EditMode,
@@ -362,6 +370,8 @@ pub struct InputState<'b> {
     last_char_search: Option<CharSearch>, // vi only
     #[cfg(feature = "custom-bindings")]
     macro_queue: VecDeque<Cmd>,
+    #[cfg(feature = "custom-bindings")]
+    macro_state: MacroState,
 }
 
 /// Provide indirect mutation to user input.
@@ -419,6 +429,8 @@ impl<'b> InputState<'b> {
             last_char_search: None,
             #[cfg(feature = "custom-bindings")]
             macro_queue: VecDeque::new(),
+            #[cfg(feature = "custom-bindings")]
+            macro_state: MacroState::Idle,
         }
     }
 
@@ -428,6 +440,32 @@ impl<'b> InputState<'b> {
 
     pub fn is_vi_cmd_mode(&self) -> bool {
         self.input_mode == InputMode::Command && self.mode == EditMode::Vi
+    }
+
+    #[cfg(feature = "custom-bindings")]
+    pub(crate) fn macro_active(&self) -> bool {
+        self.macro_state != MacroState::Idle
+    }
+
+    #[cfg(feature = "custom-bindings")]
+    pub(crate) fn take_macro_just_started(&mut self) -> bool {
+        if self.macro_state == MacroState::Starting {
+            self.macro_state = MacroState::Active;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "custom-bindings")]
+    fn dispatch_macro(&mut self, cmds: &[Cmd]) -> Option<Cmd> {
+        let mut iter = cmds.iter().cloned();
+        let first = iter.next();
+        self.macro_queue.extend(iter);
+        if !self.macro_queue.is_empty() {
+            self.macro_state = MacroState::Starting;
+        }
+        Some(first.unwrap_or(Cmd::Noop))
     }
 
     /// Parse user input into one command
@@ -440,8 +478,14 @@ impl<'b> InputState<'b> {
         single_esc_abort: bool,
         ignore_external_print: bool,
     ) -> Result<Cmd> {
+        // A queued macro command that itself reads more input (e.g. Complete,
+        // ReverseSearchHistory) consumes the following queued commands as that
+        // input rather than running them as macro steps.
         #[cfg(feature = "custom-bindings")]
         if let Some(cmd) = self.macro_queue.pop_front() {
+            if self.macro_queue.is_empty() {
+                self.macro_state = MacroState::Idle;
+            }
             return Ok(cmd);
         }
         let single_esc_abort = self.single_esc_abort(single_esc_abort);
@@ -544,6 +588,13 @@ impl<'b> InputState<'b> {
 
         let mut evt = key.into();
         if let Some(cmd) = self.custom_binding(wrt, &evt, n, positive) {
+            // Repeat-count semantics for macros are deferred: ignore the count
+            // for a dispatched (multi-command) macro instead of misapplying it
+            // to the first command only.
+            #[cfg(feature = "custom-bindings")]
+            if self.macro_state == MacroState::Starting {
+                return Ok(cmd);
+            }
             return Ok(if cmd.is_repeatable() {
                 cmd.redo(Some(n), wrt)
             } else {
@@ -1165,12 +1216,7 @@ impl InputState<'_> {
                             let ctx = EventContext::new(self, wrt);
                             handler.handle(evt, n, positive, &ctx)
                         }
-                        EventHandler::Macro(cmds) => {
-                            let mut iter = cmds.iter().cloned();
-                            let first = iter.next();
-                            self.macro_queue.extend(iter);
-                            first
-                        }
+                        EventHandler::Macro(cmds) => self.dispatch_macro(cmds),
                     }
                 } else {
                     None
@@ -1206,12 +1252,7 @@ impl InputState<'_> {
                                 let ctx = EventContext::new(self, wrt);
                                 handler.handle(evt, n, positive, &ctx)
                             }
-                            EventHandler::Macro(cmds) => {
-                                let mut iter = cmds.iter().cloned();
-                                let first = iter.next();
-                                self.macro_queue.extend(iter);
-                                first
-                            }
+                            EventHandler::Macro(cmds) => self.dispatch_macro(cmds),
                         };
                         if cmd.is_some() {
                             return Ok(cmd);
