@@ -597,6 +597,7 @@ pub struct Editor<H: Helper, I: History> {
     kill_ring: KillRing,
     config: Config,
     custom_bindings: Bindings,
+    stashed_line: Option<String>,
 }
 
 /// Default editor with default helper and `DefaultHistory`
@@ -652,6 +653,7 @@ impl<H: Helper, I: History> Editor<H, I> {
             kill_ring: KillRing::new(60),
             config,
             custom_bindings: Bindings::new(),
+            stashed_line: None,
         })
     }
 
@@ -734,6 +736,7 @@ impl<H: Helper, I: History> Editor<H, I> {
         let mut stdout = self.term.create_writer(&self.config);
 
         self.kill_ring.reset(); // TODO recreate a new kill ring vs reset
+        self.stashed_line = None; // drop any stash the caller did not consume
         let ctx = Context::new(&self.history);
         let mut s = State::new(&mut stdout, prompt, self.helper.as_ref(), ctx);
 
@@ -796,6 +799,12 @@ impl<H: Helper, I: History> Editor<H, I> {
             let should_reset = should_reset && (macro_just_started || !macro_undo_group_active);
             if should_reset {
                 self.kill_ring.reset();
+            }
+
+            if cmd == Cmd::Stash {
+                self.stashed_line = Some(s.line.as_str().to_owned());
+                close_macro_group!();
+                continue;
             }
 
             // First trigger commands that need extra input
@@ -969,6 +978,16 @@ impl<H: Helper, I: History> Editor<H, I> {
     pub fn unbind_sequence<E: Into<Event>>(&mut self, key_seq: E) -> Option<EventHandler> {
         self.custom_bindings
             .remove(&Event::normalize(key_seq.into()))
+    }
+
+    /// Returns and clears the line saved by a previous `Cmd::Stash`.
+    ///
+    /// Typical usage: after a macro that stashes the current input, clears
+    /// the line, submits a different command, and accepts — call this to
+    /// recover the original input and pass it as `initial` to the next
+    /// `readline_with_initial`.
+    pub fn take_stashed_line(&mut self) -> Option<String> {
+        self.stashed_line.take()
     }
 
     /// Returns an iterator over edited lines.
